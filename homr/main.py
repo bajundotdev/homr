@@ -13,10 +13,7 @@ import onnxruntime as ort
 
 from homr import color_adjust, download_utils
 from homr.autocrop import autocrop_with_offset
-from homr.bar_line_detection import (
-    detect_bar_lines,
-    prepare_bar_line_image,
-)
+from homr.bar_line_detection import detect_bar_lines, prepare_bar_line_image
 from homr.bounding_boxes import (
     BoundingEllipse,
     RotatedBoundingBox,
@@ -42,11 +39,17 @@ from homr.staff_detection import (
     estimate_unit_size_from_clefs,
     make_lines_stronger,
 )
-from homr.staff_parsing import parse_staffs
+from homr.staff_parsing import (
+    SystemReading,
+    parts_of_page,
+    parts_of_score,
+    read_systems,
+)
 from homr.staff_position_save_load import load_staff_positions, save_staff_positions
 from homr.system_repair import repair_systems
 from homr.title_detection import detect_title, download_ocr_weights
 from homr.transformer.configs import Config, default_config
+from homr.transformer.vocabulary import EncodedSymbol
 from homr.type_definitions import NDArray
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -182,11 +185,16 @@ class ProcessingConfig:
     title_detection: bool
 
 
-def process_image(
-    image_path: str,
-    config: ProcessingConfig,
-    xml_generator_args: XmlGeneratorArguments,
-) -> str:
+@dataclass
+class PageReading:
+    """The systems which were read on a page, before they are written as MusicXML."""
+
+    xml_file: str
+    title: str
+    systems: list[SystemReading]
+
+
+def read_page(image_path: str, config: ProcessingConfig) -> PageReading:
     eprint("Processing " + image_path)
     xml_file = replace_extension(image_path, ".musicxml")
     debug_cleanup: Debug | None = None
@@ -204,7 +212,7 @@ def process_image(
                 debug, image, staff_position_files, config.selected_staff
             )
             title = ""
-            # parse_staffs() expects a grayscale image (cv2.findContours requires it),
+            # read_systems() expects a grayscale image (cv2.findContours requires it),
             # matching what the normal detect_staffs_in_image() path hands it
             # (predictions.preprocessed). Apply the same CLAHE preprocessing here so the
             # two code paths feed the symbol-recognition encoder consistent input.
@@ -220,7 +228,7 @@ def process_image(
         transformer_config.use_gpu_inference = config.transformer_use_gpu
         transformer_config.use_coreml_encoder = config.coreml_encoder
 
-        result_staffs = parse_staffs(
+        systems = read_systems(
             debug,
             multi_staffs,
             image,
@@ -233,27 +241,47 @@ def process_image(
             title = title_future.result(60)
         eprint("Found title:", title)
 
-        eprint("Writing XML", result_staffs)
-        xml = generate_xml(xml_generator_args, result_staffs, title)
-        ET.ElementTree(xml).write(xml_file, encoding="unicode", xml_declaration=True)
-
-        eprint("Finished parsing " + str(len(result_staffs)) + " staves")
         teaser_file = replace_extension(image_path, "_teaser.png")
         if config.write_staff_positions:
             staff_position_files = replace_extension(image_path, ".txt")
             save_staff_positions(multi_staffs, image.shape, staff_position_files)
         debug.write_teaser(teaser_file, multi_staffs)
         debug.clean_debug_files_from_previous_runs()
+    finally:
+        if debug_cleanup is not None:
+            debug_cleanup.clean_debug_files_from_previous_runs()
+    return PageReading(xml_file, title, systems)
 
-        eprint("Result was written to", xml_file)
+
+def write_page(
+    page: PageReading, parts: list[list[EncodedSymbol]], xml_generator_args: XmlGeneratorArguments
+) -> str:
+    try:
+        eprint("Writing XML", parts)
+        xml = generate_xml(xml_generator_args, parts, page.title)
+        ET.ElementTree(xml).write(page.xml_file, encoding="unicode", xml_declaration=True)
+        eprint("Finished parsing " + str(len(parts)) + " staves")
+        eprint("Result was written to", page.xml_file)
+    except:
+        if os.path.exists(page.xml_file):
+            os.remove(page.xml_file)
+        raise
+    return page.xml_file
+
+
+def process_image(
+    image_path: str,
+    config: ProcessingConfig,
+    xml_generator_args: XmlGeneratorArguments,
+) -> str:
+    xml_file = replace_extension(image_path, ".musicxml")
+    try:
+        page = read_page(image_path, config)
     except:
         if os.path.exists(xml_file):
             os.remove(xml_file)
         raise
-    finally:
-        if debug_cleanup is not None:
-            debug_cleanup.clean_debug_files_from_previous_runs()
-    return xml_file
+    return write_page(page, parts_of_page(page.systems), xml_generator_args)
 
 
 @dataclass
@@ -437,18 +465,28 @@ def run_homr(
     images: list, config: ProcessingConfig, xml_generator_args: XmlGeneratorArguments
 ) -> None:
     """
-    Runs homr on all images in a list and merges them into musicxml using relieur
+    Runs homr on all images in a list and merges them into musicxml using relieur.
+    All pages are read first, so that every page gets the same parts.
     """
+    if len(images) == 1:
+        process_image(images[0], config, xml_generator_args)
+        return
     eprint("Merging", len(images), "files:", images)
-    xml_paths = []
+    pages = []
     for image_file in images:
         eprint("=========================================")
         try:
-            xml_paths.append(process_image(image_file, config, xml_generator_args))
+            pages.append(read_page(image_file, config))
             eprint("Finished", image_file)
         except Exception as e:
             eprint(f"An error occurred while processing {image_file}: {e}")
             raise
+
+    parts = parts_of_score([page.systems for page in pages])
+    xml_paths = [
+        write_page(page, page_parts, xml_generator_args)
+        for page, page_parts in zip(pages, parts, strict=True)
+    ]
 
     if len(xml_paths) == len(images) and len(xml_paths) > 1:
         m, _, _ = process_concat(xml_paths)

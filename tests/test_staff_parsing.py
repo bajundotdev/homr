@@ -1,7 +1,17 @@
 import unittest
 
 from homr.model import MultiStaff, Staff, StaffPoint
-from homr.staff_parsing import _assign_parts, _clean_up_voice, _measure_rests_like
+from homr.music_xml_generator import XmlGeneratorArguments, generate_xml
+from homr.staff_parsing import (
+    SystemReading,
+    _assemble_parts,
+    _assign_parts,
+    _clean_up_voice,
+    _count_measures,
+    _measure_rests_like,
+    parts_of_page,
+    parts_of_score,
+)
 from homr.system_repair import (
     _common_layout,
     _ensure_same_number_of_staffs,
@@ -294,19 +304,6 @@ class TestStaffParsing(unittest.TestCase):
         staffs.append(MultiStaff([make_staff(6, is_grandstaff=True)], []))
         self.assertEqual(staffs, _unify_grand_staffs(staffs))
 
-    def test_assign_parts_with_hidden_voice(self) -> None:
-        # Voice and piano, in the second system the voice is hidden
-        voice_and_piano = MultiStaff([make_staff(0), make_staff(1, is_grandstaff=True)], [])
-        piano = make_row(3, is_grandstaff=True)
-
-        self.assertEqual([(0, 1), (1,)], _assign_parts([voice_and_piano, piano]))
-
-    def test_assign_parts_ambiguous(self) -> None:
-        # Two voices, a system with one of them doesn't tell which one
-        two_voices = MultiStaff([make_staff(0), make_staff(1)], [])
-
-        self.assertIsNone(_assign_parts([two_voices, make_row(3)]))
-
     def test_measure_rests_like(self) -> None:
         symbols = [
             EncodedSymbol("clef_G2"),
@@ -341,3 +338,157 @@ timeSignature/4 . . . . ."""
 
         right_hand = [s.rhythm for s in result if s.position == "upper" and "note" in s.rhythm]
         self.assertEqual(["note_12"] * 9, right_hand)
+
+
+# Layouts of systems: is_grandstaff per staff
+PIANO = (True,)
+CHOIR_AND_PIANO = (False, False, True)
+
+
+def single_staff(clef: str, measures: int, pitch: str = "C4") -> list[EncodedSymbol]:
+    """A staff with a whole note in every measure."""
+    symbols = [EncodedSymbol(clef, position="upper"), EncodedSymbol("keySignature_0")]
+    symbols.append(EncodedSymbol("timeSignature/4"))
+    for _ in range(measures):
+        symbols += [EncodedSymbol("note_1", pitch, position="upper"), EncodedSymbol("barline")]
+    return symbols
+
+
+def grand_staff(measures: int) -> list[EncodedSymbol]:
+    """A piano grand staff with a whole note in each hand in every measure."""
+    symbols = [EncodedSymbol("clef_G2", position="upper"), EncodedSymbol("chord")]
+    symbols += [EncodedSymbol("clef_F4", position="lower"), EncodedSymbol("keySignature_0")]
+    symbols.append(EncodedSymbol("timeSignature/4"))
+    for _ in range(measures):
+        symbols += [EncodedSymbol("note_1", "C5", position="upper"), EncodedSymbol("chord")]
+        symbols += [EncodedSymbol("note_1", "C3", position="lower"), EncodedSymbol("barline")]
+    return symbols
+
+
+def piano_system(measures: int = 2) -> SystemReading:
+    return SystemReading(PIANO, [grand_staff(measures)])
+
+
+def choir_system(measures: int = 2) -> SystemReading:
+    """Soprano and alto, tenor and bass and the piano."""
+    staffs = [single_staff("clef_G2", measures, "A4"), single_staff("clef_F4", measures, "A3")]
+    return SystemReading(CHOIR_AND_PIANO, [*staffs, grand_staff(measures)])
+
+
+def measures_per_part(parts: list[list[EncodedSymbol]]) -> list[int]:
+    xml = generate_xml(XmlGeneratorArguments(), parts, "")
+    return [len(part.findall("measure")) for part in xml.findall("part")]
+
+
+def pitches(part: list[EncodedSymbol]) -> set[str]:
+    return {s.pitch for s in part if s.rhythm.startswith("note")}
+
+
+class TestScoreParts(unittest.TestCase):
+    def test_assign_parts_with_hidden_voice(self) -> None:
+        # Voice and piano, in the second system the voice is hidden
+        voice_and_piano = SystemReading((False, True), [single_staff("clef_G2", 2), grand_staff(2)])
+
+        slots = _assign_parts([voice_and_piano, piano_system()], (False, True))
+
+        self.assertEqual([(0, 1), (1,)], slots)
+
+    def test_assign_parts_by_clef(self) -> None:
+        # One choir staff and the piano, the clef tells which choir staff it is
+        tenor_and_bass = SystemReading((False, True), [single_staff("clef_F4", 2), grand_staff(2)])
+        soprano_and_alto = SystemReading(
+            (False, True), [single_staff("clef_G2", 2), grand_staff(2)]
+        )
+        systems = [choir_system(), tenor_and_bass, soprano_and_alto]
+
+        slots = _assign_parts(systems, CHOIR_AND_PIANO)
+
+        self.assertEqual([(0, 1, 2), (1, 2), (0, 2)], slots)
+
+    def test_assign_parts_without_clefs_takes_the_lowest_parts(self) -> None:
+        # Two voices with the same clef, a system with one of them: the lower one
+        two_voices = SystemReading((False, False), [single_staff("clef_G2", 2)] * 2)
+        one_voice = SystemReading((False,), [single_staff("clef_G2", 2)])
+
+        self.assertEqual([(0, 1), (1,)], _assign_parts([two_voices, one_voice], (False, False)))
+
+    def test_assign_parts_returns_none_if_a_system_doesnt_fit(self) -> None:
+        two_pianos = SystemReading((True, True), [grand_staff(2)] * 2)
+
+        self.assertIsNone(_assign_parts([choir_system(), two_pianos], CHOIR_AND_PIANO))
+
+    def test_parts_of_score_with_staffs_per_system_2_2_4_4_4_2(self) -> None:
+        # A piano introduction, the choir enters, a piano interlude; the first page has
+        # only the piano
+        pages = [
+            [piano_system(), piano_system()],
+            [choir_system(), choir_system()],
+            [choir_system(), piano_system()],
+        ]
+
+        result = parts_of_score(pages)
+
+        self.assertEqual([3, 3, 3], [len(parts) for parts in result])
+        for parts in result:
+            self.assertEqual([4, 4, 4], measures_per_part(parts))
+        soprano_and_alto, tenor_and_bass, piano = result[0]
+        self.assertEqual(set(), pitches(soprano_and_alto) | pitches(tenor_and_bass))
+        self.assertEqual({"C5", "C3"}, pitches(piano))
+        self.assertEqual(["A4"] * 4, [s.pitch for s in result[1][0] if s.rhythm == "note_1"])
+        self.assertEqual(["A3"] * 2, [s.pitch for s in result[2][1] if s.rhythm == "note_1"])
+
+    def test_parts_of_score_falls_back_to_parts_per_page(self) -> None:
+        # The pages don't fit one layout: voice above or below the piano
+        voice_above = SystemReading((False, True), [single_staff("clef_G2", 1), grand_staff(1)])
+        voice_below = SystemReading((True, False), [grand_staff(1), single_staff("clef_G2", 1)])
+
+        result = parts_of_score([[voice_above], [voice_below]])
+
+        self.assertEqual([2, 2], [len(parts) for parts in result])
+        self.assertEqual({"C4"}, pitches(result[0][0]))
+        self.assertEqual({"C5", "C3"}, pitches(result[1][0]))
+
+    def test_parts_of_page_with_hidden_choir(self) -> None:
+        parts = parts_of_page([piano_system(), piano_system(), choir_system()])
+
+        self.assertEqual([6, 6, 6], measures_per_part(parts))
+        self.assertEqual({"A4"}, pitches(parts[0]))
+
+    def test_parts_of_page_reads_staffs_on_their_own_if_layout_is_unclear(self) -> None:
+        voice_and_piano = SystemReading((False, True), [single_staff("clef_G2", 1), grand_staff(1)])
+        piano_and_voice = SystemReading((True, False), [grand_staff(1), single_staff("clef_G2", 1)])
+        voice = SystemReading((False,), [single_staff("clef_G2", 1)])
+
+        parts = parts_of_page([voice_and_piano, piano_and_voice, voice])
+
+        self.assertEqual(1, len(parts))
+
+    def test_staff_without_symbols_gets_rests(self) -> None:
+        system = choir_system()
+        system.staffs[2] = []
+
+        parts = _assemble_parts([choir_system(), system], [(0, 1, 2)] * 2, CHOIR_AND_PIANO)
+
+        self.assertEqual([4, 4, 4], measures_per_part(parts))
+        self.assertEqual(2, len([s for s in parts[2] if s.rhythm == "note_1" and s.pitch == "C3"]))
+
+    def test_parts_get_the_same_number_of_measures(self) -> None:
+        # A bar line was missed in the piano, the piano gets a rest at the end
+        system = choir_system(measures=3)
+        system.staffs[2] = grand_staff(2)
+
+        parts = _assemble_parts([system, choir_system()], [(0, 1, 2)] * 2, CHOIR_AND_PIANO)
+
+        self.assertEqual([5, 5, 5], measures_per_part(parts))
+        self.assertEqual((5, False), _count_measures(parts[2]))
+
+    def test_measure_rests_like_keeps_multirests(self) -> None:
+        symbols = [EncodedSymbol("rest_4m"), EncodedSymbol("barline")]
+        symbols += [EncodedSymbol("note_1", "C4"), EncodedSymbol("barline")]
+
+        result = _measure_rests_like(symbols, is_grandstaff=False)
+
+        self.assertEqual(
+            ["rest_4m", "barline", "measureRest", "barline"], [s.rhythm for s in result]
+        )
+        self.assertEqual((5, False), _count_measures(result))

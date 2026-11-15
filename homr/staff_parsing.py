@@ -1,5 +1,9 @@
 import itertools
 import math
+import re
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -15,7 +19,11 @@ from homr.staff_parsing_tromr import parse_staff_tromr
 from homr.staff_regions import StaffRegions
 from homr.system_repair import _layout
 from homr.transformer.configs import Config, default_config
-from homr.transformer.vocabulary import EncodedSymbol, remove_duplicated_symbols
+from homr.transformer.vocabulary import (
+    EncodedSymbol,
+    is_lower_position,
+    remove_duplicated_symbols,
+)
 from homr.triplet_restoration import restore_unmarked_triplets
 from homr.type_definitions import NDArray
 
@@ -259,36 +267,151 @@ def parse_staff_image(
     return result
 
 
-def _slots_in_layout(row: tuple[bool, ...], layout: tuple[bool, ...]) -> tuple[int, ...] | None:
+@dataclass
+class SystemReading:
+    """The transcription of one system: is_grandstaff and the symbols of each of its staffs."""
+
+    layout: tuple[bool, ...]
+    # Empty if nothing was read in the staff
+    staffs: list[list[EncodedSymbol]]
+
+
+def read_systems(
+    debug: Debug,
+    staffs: list[MultiStaff],
+    image: NDArray,
+    config: Config,
+    selected_staff: int = -1,
+    page_to_input_image: PointMapping = identity,
+) -> list[SystemReading]:
     """
-    The staffs of the layout which the staffs of a system are, None if that isn't
-    unique, e.g. a system shows only the piano as the voice is hidden.
+    Dewarps each staff and then runs it through an algorithm which extracts
+    the rhythm and pitch information.
+
+    page_to_input_image maps the coordinates of image back to the image the user provided,
+    it's used to fill EncodedSymbol.image_coordinates.
     """
-    matches = [
+    regions = StaffRegions(staffs)
+    i = 0
+    result = []
+    for staff_index, row in enumerate(staffs):
+        symbols_of_row = []
+        for staff in row.staffs:
+            if selected_staff >= 0 and staff_index != selected_staff:
+                eprint("Ignoring staff due to selected_staff argument", i)
+                symbols = []
+            else:
+                symbols = parse_staff_image(
+                    debug, i, staff, image, regions, config, page_to_input_image
+                )
+                if len(symbols) == 0:
+                    eprint("Nothing found in staff", i)
+            i += 1
+            symbols_of_row.append(symbols)
+        result.append(SystemReading(_layout(row), symbols_of_row))
+    return result
+
+
+def _common_layout(layouts: Iterable[tuple[bool, ...]]) -> tuple[bool, ...] | None:
+    """
+    The layout of the systems with the most staffs, they show all parts. None if systems
+    of that size differ, then it's unclear which parts there are.
+    """
+    unique = set(layouts)
+    if len(unique) == 0:
+        return None
+    largest = max(unique, key=len)
+    if any(len(layout) == len(largest) and layout != largest for layout in unique):
+        return None
+    return largest
+
+
+def _possible_slots(row: tuple[bool, ...], layout: tuple[bool, ...]) -> list[tuple[int, ...]]:
+    """The ways in which the staffs of a system can be staffs of the layout, top to bottom."""
+    return [
         slots
         for slots in itertools.combinations(range(len(layout)), len(row))
         if all(
             layout[slot] == is_grandstaff for slot, is_grandstaff in zip(slots, row, strict=True)
         )
     ]
-    return matches[0] if len(matches) == 1 else None
 
 
-def _assign_parts(staffs: list[MultiStaff]) -> list[tuple[int, ...]] | None:
+def _clefs(symbols: list[EncodedSymbol]) -> tuple[str | None, str | None]:
+    """The first clef of the upper and of the lower staff."""
+    clefs = [s for s in symbols if s.rhythm.startswith("clef")]
+    upper = next((s.rhythm for s in clefs if not is_lower_position(s.position)), None)
+    lower = next((s.rhythm for s in clefs if is_lower_position(s.position)), None)
+    return upper, lower
+
+
+def _assign_parts(
+    systems: list[SystemReading], layout: tuple[bool, ...]
+) -> list[tuple[int, ...]] | None:
     """
-    For every system the parts which its staffs belong to, the parts are the staffs
-    of the largest system. None if a system doesn't fit into it unambiguously.
+    For every system the parts which its staffs belong to, the parts are the staffs of
+    the layout. If a system fits in several ways, e.g. one choir staff and the piano
+    while the score has two choir staffs, the clefs which the parts have in the other
+    systems decide. If they don't, the system gets the lowest parts: in vocal music the
+    accompaniment is what is still shown when voices rest. None if a system doesn't fit.
     """
-    layouts = {_layout(row) for row in staffs}
-    largest = max(layouts, key=len)
-    if any(len(layout) == len(largest) and layout != largest for layout in layouts):
+    options = [_possible_slots(system.layout, layout) for system in systems]
+    if any(len(slots) == 0 for slots in options):
         return None
-    result = []
-    for row in staffs:
-        slots = _slots_in_layout(_layout(row), largest)
-        if slots is None:
-            return None
-        result.append(slots)
+    clefs_of_part: list[Counter[tuple[str | None, str | None]]] = [Counter() for _ in layout]
+    for system, slots in zip(systems, options, strict=True):
+        if len(slots) == 1:
+            for slot, symbols in zip(slots[0], system.staffs, strict=True):
+                if symbols:
+                    clefs_of_part[slot][_clefs(symbols)] += 1
+
+    def clef_matches(system: SystemReading, slots: tuple[int, ...]) -> float:
+        matches = 0.0
+        for slot, symbols in zip(slots, system.staffs, strict=True):
+            seen = clefs_of_part[slot]
+            if symbols and seen.total() > 0:
+                matches += seen[_clefs(symbols)] / seen.total()
+        return matches
+
+    def best(system: SystemReading, slots: list[tuple[int, ...]]) -> tuple[int, ...]:
+        return max(slots, key=lambda candidate: (clef_matches(system, candidate), candidate))
+
+    return [best(system, slots) for system, slots in zip(systems, options, strict=True)]
+
+
+def _multirest_length(symbol: EncodedSymbol) -> int:
+    match = re.fullmatch(r"rest_(\d+)m", symbol.rhythm)
+    return int(match.group(1)) if match else 1
+
+
+def _is_measure_content(symbol: EncodedSymbol) -> bool:
+    return symbol.rhythm.startswith(("note", "rest")) or symbol.rhythm == "measureRest"
+
+
+def _ends_measure(symbol: EncodedSymbol) -> bool:
+    return "barline" in symbol.rhythm or "repeat" in symbol.rhythm
+
+
+def _count_measures(symbols: list[EncodedSymbol]) -> tuple[int, bool]:
+    """The number of measures with notes or rests and if the last one has no bar line yet."""
+    count = 0
+    in_measure = False
+    for symbol in symbols:
+        if _is_measure_content(symbol) and not in_measure:
+            count += _multirest_length(symbol)
+            in_measure = True
+        elif _ends_measure(symbol):
+            in_measure = False
+    return count, in_measure
+
+
+def _measure_rest(is_grandstaff: bool) -> list[EncodedSymbol]:
+    positions = ["upper", "lower"] if is_grandstaff else ["upper"]
+    result: list[EncodedSymbol] = []
+    for i, position in enumerate(positions):
+        if i > 0:
+            result.append(EncodedSymbol("chord"))
+        result.append(EncodedSymbol("measureRest", position=position))
     return result
 
 
@@ -297,24 +420,125 @@ def _measure_rests_like(symbols: list[EncodedSymbol], is_grandstaff: bool) -> li
     Rests for a staff which is hidden in a system: one per measure of the symbols
     another staff of the system has, with the same barlines.
     """
-    positions = ["upper", "lower"] if is_grandstaff else ["upper"]
     result: list[EncodedSymbol] = []
     in_measure = False
     for symbol in symbols:
-        if symbol.rhythm.startswith(("note", "rest")) and not in_measure:
-            for i, position in enumerate(positions):
-                if i > 0:
-                    result.append(EncodedSymbol("chord"))
-                result.append(EncodedSymbol("measureRest", position=position))
+        if _is_measure_content(symbol) and not in_measure:
+            if _multirest_length(symbol) > 1:
+                result.append(EncodedSymbol(symbol.rhythm))
+            else:
+                result.extend(_measure_rest(is_grandstaff))
             in_measure = True
-        elif "barline" in symbol.rhythm or "repeat" in symbol.rhythm:
+        elif _ends_measure(symbol):
             result.append(EncodedSymbol(symbol.rhythm))
             in_measure = False
     return result
 
 
+def _pad_measures(
+    symbols: list[EncodedSymbol], measures: int, is_grandstaff: bool, ends_open: bool
+) -> list[EncodedSymbol]:
+    """
+    Adds measure rests until the symbols have the given number of measures, so that
+    a missed bar line doesn't shift the part against the others in every later system.
+    """
+    count, in_measure = _count_measures(symbols)
+    if count >= measures:
+        return symbols
+    result = list(symbols)
+    for _ in range(measures - count):
+        if in_measure:
+            result.append(EncodedSymbol("barline"))
+        result.extend(_measure_rest(is_grandstaff))
+        in_measure = True
+    if not ends_open:
+        result.append(EncodedSymbol("barline"))
+    return result
+
+
 def _clean_up_voice(symbols: list[EncodedSymbol]) -> list[EncodedSymbol]:
     return restore_unmarked_triplets(remove_duplicated_symbols(symbols))
+
+
+def _assemble_parts(
+    systems: list[SystemReading], slots: list[tuple[int, ...]], layout: tuple[bool, ...]
+) -> list[list[EncodedSymbol]]:
+    """
+    The symbols of every part of the layout. A part which is hidden in a system, or in
+    which nothing was found, gets measure rests. All parts get the same number of measures
+    in every system.
+    """
+    parts: list[list[EncodedSymbol]] = [[] for _ in layout]
+    for system, system_slots in zip(systems, slots, strict=True):
+        shown = {
+            slot: symbols
+            for slot, symbols in zip(system_slots, system.staffs, strict=True)
+            if len(symbols) > 0
+        }
+        if len(shown) == 0:
+            continue
+        template = max(shown.values(), key=lambda symbols: _count_measures(symbols)[0])
+        measures, ends_open = _count_measures(template)
+        for part, is_grandstaff in enumerate(layout):
+            symbols = shown.get(part)
+            if symbols is None:
+                symbols = _measure_rests_like(template, is_grandstaff)
+            parts[part].extend(_pad_measures(symbols, measures, is_grandstaff, ends_open))
+            parts[part].append(EncodedSymbol("newline"))
+    return [_clean_up_voice(part) for part in parts]
+
+
+def _staffs_on_their_own(systems: list[SystemReading]) -> list[list[EncodedSymbol]]:
+    """One voice with every staff after the other."""
+    voice: list[EncodedSymbol] = []
+    for system in systems:
+        for symbols in system.staffs:
+            if len(symbols) > 0:
+                voice.extend(symbols)
+                voice.append(EncodedSymbol("newline"))
+    return [_clean_up_voice(voice)]
+
+
+def parts_of_page(systems: list[SystemReading]) -> list[list[EncodedSymbol]]:
+    """
+    The parts of a page. The parts are the staffs of the largest system, a system with
+    fewer staffs hides some of them.
+    """
+    if len(systems) == 0:
+        return []
+    layout = _common_layout(system.layout for system in systems)
+    slots = _assign_parts(systems, layout) if layout is not None else None
+    if slots is None and len({len(system.layout) for system in systems}) == 1:
+        # Same number of staffs, but they differ in grand staffs: staff by staff
+        layout = systems[0].layout
+        slots = [tuple(range(len(layout)))] * len(systems)
+    if layout is None or slots is None:
+        eprint("The layout changes on the page, reading every staff on its own")
+        return _staffs_on_their_own(systems)
+    if any(len(system.layout) < len(layout) for system in systems):
+        eprint("Staffs are hidden in some systems, parts of the systems:", slots)
+    return _assemble_parts(systems, slots, layout)
+
+
+def parts_of_score(pages: list[list[SystemReading]]) -> list[list[list[EncodedSymbol]]]:
+    """
+    The parts of every page, the same parts on every page: a page whose systems all hide
+    a staff, e.g. a piano introduction, gets rests for it. Falls back to the parts of each
+    page if the systems of the pages don't fit together.
+    """
+    systems = [system for page in pages for system in page]
+    layout = _common_layout(system.layout for system in systems)
+    slots = _assign_parts(systems, layout) if layout is not None else None
+    if layout is None or slots is None:
+        eprint("The pages don't share a layout of their systems, finding the parts per page")
+        return [parts_of_page(page) for page in pages]
+    eprint("Parts of the score:", len(layout), "parts, staffs of the parts per system:", slots)
+    result = []
+    start = 0
+    for page in pages:
+        result.append(_assemble_parts(page, slots[start : start + len(page)], layout))
+        start += len(page)
+    return result
 
 
 def parse_staffs(
@@ -326,60 +550,7 @@ def parse_staffs(
     page_to_input_image: PointMapping = identity,
 ) -> list[list[EncodedSymbol]]:
     """
-    Dewarps each staff and then runs it through an algorithm which extracts
-    the rhythm and pitch information.
-
-    page_to_input_image maps the coordinates of image back to the image the user provided,
-    it's used to fill EncodedSymbol.image_coordinates.
+    Reads the staffs of a page, see read_systems, and returns the symbols of each part.
     """
-    parts = [tuple(range(len(row.staffs))) for row in staffs]
-    if len({len(staff.staffs) for staff in staffs}) > 1:
-        # The voices are read across systems, a system with fewer staffs hides some
-        assigned = _assign_parts(staffs)
-        if assigned is None:
-            eprint("The layout changes on the page, reading every staff on its own")
-            staffs = [single for staff in staffs for single in staff.break_apart()]
-            parts = [(0,)] * len(staffs)
-        else:
-            eprint("Staffs are hidden in some systems, parts of the systems:", assigned)
-            parts = assigned
-    # For simplicity we call every staff in a multi staff a voice,
-    # even if it's part of a grand staff.
-    number_of_voices = max(len(staff.staffs) for staff in staffs)
-    layout = next(_layout(row) for row in staffs if len(row.staffs) == number_of_voices)
-    i = 0
-    results: dict[tuple[int, int], list[EncodedSymbol]] = {}
-    regions = StaffRegions(staffs)
-    for voice in range(number_of_voices):
-        for staff_index, row in enumerate(staffs):
-            if voice not in parts[staff_index]:
-                continue
-            if selected_staff >= 0 and staff_index != selected_staff:
-                eprint("Ignoring staff due to selected_staff argument", i)
-                i += 1
-                continue
-            staff = row.staffs[parts[staff_index].index(voice)]
-            result_staff = parse_staff_image(
-                debug, i, staff, image, regions, config, page_to_input_image
-            )
-            i += 1
-            if len(result_staff) == 0:
-                eprint("Skipping empty staff", i - 1)
-                continue
-            results[(staff_index, voice)] = result_staff
-
-    voices = []
-    for voice in range(number_of_voices):
-        result_for_voice = []
-        for staff_index, slots in enumerate(parts):
-            symbols = results.get((staff_index, voice))
-            shown = [results[(staff_index, v)] for v in slots if (staff_index, v) in results]
-            if voice not in slots and len(shown) > 0:
-                symbols = _measure_rests_like(shown[0], layout[voice])
-            if symbols is None:
-                continue
-            result_for_voice.extend(symbols)
-            result_for_voice.append(EncodedSymbol("newline"))
-
-        voices.append(_clean_up_voice(result_for_voice))
-    return voices
+    systems = read_systems(debug, staffs, image, config, selected_staff, page_to_input_image)
+    return parts_of_page(systems)
